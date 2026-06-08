@@ -1,1 +1,31 @@
-graph-greedy/
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+env/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Data / external repos
+external_data/
+data/
+
+# Generated results
+results/
+results_*/
+results-greedy/
+results_percent_*/
+results_baselines_*/
+dataset_audit/
+
+# Large / temporary files
+*.zip
+*.tar
+*.tar.gz
+*.log

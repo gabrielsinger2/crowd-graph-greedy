@@ -105,7 +105,6 @@ Outputs
 
 out_dir/
     per_dataset_results.csv
-    method_comparison_summary.csv
     selected_workers.json
     dataset_registry.csv
     plot_accuracy_by_dataset.png
@@ -751,342 +750,6 @@ def greedy_select(
     return final_set, pd.DataFrame(history)
 
 
-
-# =============================================================================
-# Budget-matched selection baselines
-# =============================================================================
-
-DEFAULT_METHODS = [
-    "MV-all",
-    "Random-B",
-    "TopAccuracy-B",
-    "MaxCoverage-B",
-    "AccuracyCoverage-B",
-    "LowCorrelation-B",
-    "MaxIndependentSet-B",
-    "GreedyGraph-B",
-    "GreedyGraph-WeightedMV",
-    "TopAccuracy-WeightedMV",
-    "OracleTopAccuracy-B",
-]
-
-
-def select_top_accuracy_workers(workers: Sequence[str], q: Dict[str, float], budget: int) -> List[str]:
-    """Select the workers with the lowest train error rates."""
-    return sorted(list(workers), key=lambda w: (float(q.get(w, 0.5)), str(w)))[:budget]
-
-
-def select_random_workers(workers: Sequence[str], budget: int, rng: np.random.Generator) -> List[str]:
-    workers = list(workers)
-    if len(workers) == 0:
-        return []
-    k = min(int(budget), len(workers))
-    return list(rng.choice(workers, size=k, replace=False))
-
-
-def worker_item_sets(df: pd.DataFrame, workers: Sequence[str]) -> Dict[str, Set[str]]:
-    W = set(map(str, workers))
-    return {
-        str(w): set(g["item"].astype(str).unique())
-        for w, g in df[df["worker"].astype(str).isin(W)].groupby("worker")
-    }
-
-
-def select_max_coverage_workers(train: pd.DataFrame, workers: Sequence[str], budget: int) -> List[str]:
-    """
-    Greedy maximum-coverage baseline:
-    at each step, select the worker covering the largest number of still-uncovered train items.
-    """
-    workers = list(workers)
-    item_sets = worker_item_sets(train, workers)
-    selected: List[str] = []
-    covered: Set[str] = set()
-
-    for _ in range(min(int(budget), len(workers))):
-        best = None
-        best_gain = -1
-        for w in workers:
-            if w in selected:
-                continue
-            gain = len(item_sets.get(w, set()) - covered)
-            if gain > best_gain:
-                best = w
-                best_gain = gain
-        if best is None:
-            break
-        selected.append(best)
-        covered |= item_sets.get(best, set())
-    return selected
-
-
-def select_accuracy_coverage_workers(
-    train: pd.DataFrame,
-    workers: Sequence[str],
-    q: Dict[str, float],
-    budget: int,
-    lambda_coverage: float = 1.0,
-) -> List[str]:
-    """
-    Greedy hybrid baseline.
-
-    It trades off:
-        - low worker error rate
-        - marginal train-item coverage gain
-
-    Candidate score:
-        score(w | S) = - q_w + lambda_coverage * coverage_gain_rate(w | S)
-    """
-    workers = list(workers)
-    item_sets = worker_item_sets(train, workers)
-    total_items = max(1, train["item"].nunique())
-
-    selected: List[str] = []
-    covered: Set[str] = set()
-
-    for _ in range(min(int(budget), len(workers))):
-        best = None
-        best_score = -float("inf")
-        best_gain = -1
-        for w in workers:
-            if w in selected:
-                continue
-            gain = len(item_sets.get(w, set()) - covered)
-            gain_rate = gain / total_items
-            score = -float(q.get(w, 0.5)) + float(lambda_coverage) * gain_rate
-            if (score, gain, -float(q.get(w, 0.5)), str(w)) > (
-                best_score, best_gain, -float(q.get(best, 0.5)) if best is not None else -float("inf"), str(best)
-            ):
-                best = w
-                best_score = score
-                best_gain = gain
-        if best is None:
-            break
-        selected.append(best)
-        covered |= item_sets.get(best, set())
-    return selected
-
-
-def select_max_independent_accuracy_workers(
-    workers: Sequence[str],
-    q: Dict[str, float],
-    edges: Set[Tuple[str, str]],
-    budget: int,
-) -> List[str]:
-    """
-    Hard graph baseline:
-    first greedily selects accurate workers that keep the selected set independent.
-    If the independent set is smaller than the budget, it completes with workers
-    that add the fewest edges to the selected set, then lowest error.
-    """
-    ordered = sorted(list(workers), key=lambda w: (float(q.get(w, 0.5)), str(w)))
-    selected: List[str] = []
-
-    for w in ordered:
-        if len(selected) >= budget:
-            break
-        if all(tuple(sorted((w, u))) not in edges for u in selected):
-            selected.append(w)
-
-    if len(selected) < budget:
-        remaining = [w for w in ordered if w not in selected]
-        while len(selected) < budget and remaining:
-            remaining.sort(
-                key=lambda w: (
-                    sum(1 for u in selected if tuple(sorted((w, u))) in edges),
-                    float(q.get(w, 0.5)),
-                    str(w),
-                )
-            )
-            selected.append(remaining.pop(0))
-
-    return selected[:budget]
-
-
-def worker_log_odds_weights(q: Dict[str, float], eps: float = 1e-6) -> Dict[str, float]:
-    """
-    Positive clipped log-odds weights from train error estimates.
-
-        w_s = max(0, log((1-q_s)/q_s)) + eps
-
-    Negative weights are clipped to zero because in multi-class plurality voting
-    a negative vote for one class does not cleanly translate into a vote for all
-    other classes.
-    """
-    weights = {}
-    for w, err in q.items():
-        err = float(np.clip(err, eps, 1.0 - eps))
-        weights[w] = max(0.0, math.log((1.0 - err) / err)) + eps
-    return weights
-
-
-def weighted_vote(
-    g: pd.DataFrame,
-    weights: Dict[str, float],
-    tie_order: Optional[List[str]] = None,
-) -> Optional[str]:
-    if len(g) == 0:
-        return None
-
-    scores: Dict[str, float] = {}
-    for _, row in g.iterrows():
-        y = str(row["label"])
-        w = str(row["worker"])
-        scores[y] = scores.get(y, 0.0) + float(weights.get(w, 1.0))
-
-    if not scores:
-        return None
-
-    max_score = max(scores.values())
-    ties = [y for y, s in scores.items() if s == max_score]
-
-    if len(ties) == 1:
-        return ties[0]
-
-    if tie_order:
-        for y in tie_order:
-            if str(y) in ties:
-                return str(y)
-
-    return sorted(map(str, ties))[0]
-
-
-def predict_with_selected_workers_aggregation(
-    df: pd.DataFrame,
-    selected: Sequence[str],
-    tie_order: Optional[List[str]] = None,
-    fallback_to_all: bool = False,
-    aggregation: str = "mv",
-    weights: Optional[Dict[str, float]] = None,
-) -> pd.DataFrame:
-    """
-    Predict with either:
-        - mv: ordinary plurality/majority vote
-        - weighted_mv: weighted plurality vote using worker weights
-    """
-    selected = set(map(str, selected))
-    weights = weights or {}
-
-    rows = []
-    for item, g in df.groupby("item"):
-        gs = g[g["worker"].astype(str).isin(selected)]
-        used_fallback = False
-
-        if len(gs) == 0 and fallback_to_all:
-            gs = g
-            used_fallback = True
-
-        if len(gs) == 0:
-            pred = None
-        elif aggregation == "mv":
-            pred = majority_vote(list(gs["label"]), tie_order)
-        elif aggregation == "weighted_mv":
-            pred = weighted_vote(gs, weights=weights, tie_order=tie_order)
-        else:
-            raise ValueError(f"Unknown aggregation: {aggregation}")
-
-        truth = None
-        if "truth" in g.columns and g["truth"].notna().any():
-            truth = g["truth"].dropna().astype(str).iloc[0]
-
-        rows.append({
-            "item": item,
-            "prediction": pred,
-            "truth": truth,
-            "covered": pred is not None,
-            "used_fallback": used_fallback,
-            "n_selected_votes": len(gs),
-        })
-
-    return pd.DataFrame(rows)
-
-
-def selection_diagnostics(
-    selected: Sequence[str],
-    q: Dict[str, float],
-    edges: Set[Tuple[str, str]],
-    max_bruteforce_nodes: int,
-) -> Dict[str, float]:
-    selected = list(selected)
-    if len(selected) == 0:
-        return {
-            "surrogate_value": np.nan,
-            "mean_error_rate": np.nan,
-            "selected_graph_density": np.nan,
-            "selected_alpha": 0,
-        }
-    return {
-        "surrogate_value": graph_surrogate(selected, q, edges, max_bruteforce_nodes=max_bruteforce_nodes),
-        "mean_error_rate": float(np.mean([q.get(w, 0.5) for w in selected])),
-        "selected_graph_density": graph_density(selected, edges),
-        "selected_alpha": len(max_independent_set_exact(selected, edges, max_bruteforce_nodes=max_bruteforce_nodes)),
-    }
-
-
-def make_method_row(
-    dataset: str,
-    method: str,
-    budget: int,
-    budget_mode: str,
-    budget_percent: Optional[float],
-    selected: Sequence[str],
-    train: pd.DataFrame,
-    test: pd.DataFrame,
-    q: Dict[str, float],
-    edges: Set[Tuple[str, str]],
-    workers_all: Sequence[str],
-    tie_order: Optional[List[str]],
-    fallback_to_all: bool,
-    max_bruteforce_nodes: int,
-    aggregation: str = "mv",
-    weights: Optional[Dict[str, float]] = None,
-    is_oracle: bool = False,
-    random_trials: Optional[List[Dict[str, float]]] = None,
-) -> Dict:
-    pred = predict_with_selected_workers_aggregation(
-        test,
-        selected,
-        tie_order=tie_order,
-        fallback_to_all=fallback_to_all,
-        aggregation=aggregation,
-        weights=weights,
-    )
-    metrics = evaluate_predictions(pred)
-    diag = selection_diagnostics(selected, q, edges, max_bruteforce_nodes=max_bruteforce_nodes)
-
-    row = {
-        "dataset": dataset,
-        "method": method,
-        "aggregation": aggregation,
-        "budget": int(budget),
-        "budget_mode": budget_mode,
-        "budget_percent": budget_percent,
-        "selected_size": len(selected),
-        "selected_workers": "|".join(map(str, selected)),
-        "accuracy": metrics["accuracy"],
-        "coverage": metrics["coverage"],
-        "n_eval_items": metrics["n_eval_items"],
-        "fallback_rate": metrics["fallback_rate"],
-        "accuracy_std": np.nan,
-        "coverage_std": np.nan,
-        "n_random_trials": 0,
-        "is_oracle": bool(is_oracle),
-        "is_final": True,
-        **diag,
-    }
-
-    if random_trials:
-        row["accuracy"] = float(np.nanmean([r["accuracy"] for r in random_trials]))
-        row["coverage"] = float(np.nanmean([r["coverage"] for r in random_trials]))
-        row["fallback_rate"] = float(np.nanmean([r["fallback_rate"] for r in random_trials]))
-        row["n_eval_items"] = int(round(float(np.nanmean([r["n_eval_items"] for r in random_trials]))))
-        row["accuracy_std"] = float(np.nanstd([r["accuracy"] for r in random_trials]))
-        row["coverage_std"] = float(np.nanstd([r["coverage"] for r in random_trials]))
-        row["n_random_trials"] = len(random_trials)
-        row["selected_workers"] = ""
-
-    return row
-
-
 # =============================================================================
 # Evaluation
 # =============================================================================
@@ -1149,91 +812,92 @@ def evaluate_predictions(pred: pd.DataFrame) -> Dict[str, float]:
 # =============================================================================
 
 def save_plots(results: pd.DataFrame, out_dir: Path, paper_baselines: Optional[pd.DataFrame] = None) -> None:
-    """
-    Plot method-level benchmark results.
-    """
     if results.empty:
         return
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    plot_df = results[results.get("is_final", True)].copy()
-    if plot_df.empty:
-        plot_df = results.copy()
 
-    # Save a compact summary for paper tables.
-    summary_cols = [
-        "dataset", "method", "aggregation", "budget", "budget_mode", "budget_percent",
-        "selected_size", "accuracy", "accuracy_std", "coverage", "coverage_std",
-        "n_eval_items", "selected_graph_density", "selected_alpha", "mean_error_rate",
-        "surrogate_value", "is_oracle",
-    ]
-    existing = [c for c in summary_cols if c in plot_df.columns]
-    plot_df[existing].to_csv(out_dir / "method_comparison_summary.csv", index=False)
-
-    def grouped_bar(metric: str, ylabel: str, title: str, filename: str) -> None:
-        if metric not in plot_df.columns:
-            return
-        pivot = plot_df.pivot_table(index="dataset", columns="method", values=metric, aggfunc="first")
-        if pivot.empty:
-            return
-        datasets = list(pivot.index)
-        methods = list(pivot.columns)
-        x = np.arange(len(datasets))
-        width = 0.85 / max(1, len(methods))
-
-        plt.figure(figsize=(max(12, 0.75 * len(datasets) + 4), 6))
-        for k, method in enumerate(methods):
-            vals = pivot[method].values.astype(float)
-            plt.bar(x + (k - (len(methods) - 1) / 2) * width, vals, width=width, label=method)
-        plt.xticks(x, datasets, rotation=60, ha="right")
-        plt.ylabel(ylabel)
-        plt.title(title)
-        plt.legend(fontsize=7, ncol=2)
-        plt.tight_layout()
-        plt.savefig(out_dir / filename, dpi=200)
-        plt.close()
-
-    grouped_bar("accuracy", "Accuracy", "Accuracy by dataset and method", "plot_accuracy_by_method.png")
-    grouped_bar("coverage", "Coverage", "Coverage by dataset and method", "plot_coverage_by_method.png")
-    grouped_bar("selected_graph_density", "Selected graph density", "Dependency density inside selected crowd", "plot_selected_graph_density_by_method.png")
-
-    # Accuracy-coverage scatter.
-    if "accuracy" in plot_df.columns and "coverage" in plot_df.columns:
-        plt.figure(figsize=(9, 6))
-        for method, g in plot_df.groupby("method"):
-            plt.scatter(g["coverage"], g["accuracy"], label=method, alpha=0.8)
-        plt.xlabel("Coverage")
+    # Plot 1: accuracy by dataset.
+    final = results[results["is_final"]].copy()
+    if not final.empty:
+        plt.figure(figsize=(12, 5))
+        plot_df = final.sort_values("accuracy")
+        plt.bar(plot_df["dataset"], plot_df["accuracy"])
+        plt.xticks(rotation=60, ha="right")
         plt.ylabel("Accuracy")
-        plt.title("Accuracy vs coverage")
-        plt.legend(fontsize=7, ncol=2)
+        plt.title("Greedy dependence-aware selection: accuracy by dataset")
         plt.tight_layout()
-        plt.savefig(out_dir / "plot_accuracy_vs_coverage.png", dpi=200)
+        plt.savefig(out_dir / "plot_accuracy_by_dataset.png", dpi=200)
         plt.close()
 
-    # Optional paper-baseline merge. This is contextual, not budget-matched.
-    if paper_baselines is not None and not paper_baselines.empty:
-        current = plot_df[["dataset", "method", "accuracy"]].copy()
-        comp = pd.concat([paper_baselines[["dataset", "method", "accuracy"]], current], ignore_index=True)
+    # Plot 2: accuracy vs budget.
+    plt.figure(figsize=(12, 6))
+    for dataset, g in results.groupby("dataset"):
+        g = g.sort_values("budget")
+        if g["accuracy"].notna().any():
+            plt.plot(g["budget"], g["accuracy"], marker="o", label=dataset)
+    plt.xlabel("Budget")
+    plt.ylabel("Accuracy")
+    plt.title("Accuracy vs selected budget")
+    plt.legend(fontsize=7, ncol=2)
+    plt.tight_layout()
+    plt.savefig(out_dir / "plot_accuracy_vs_budget.png", dpi=200)
+    plt.close()
+
+    # Plot 3: surrogate vs budget.
+    plt.figure(figsize=(12, 6))
+    for dataset, g in results.groupby("dataset"):
+        g = g.sort_values("budget")
+        if g["surrogate_value"].notna().any():
+            plt.plot(g["budget"], g["surrogate_value"], marker="o", label=dataset)
+    plt.xlabel("Budget")
+    plt.ylabel("Surrogate value")
+    plt.title("Graph-dependent surrogate vs selected budget")
+    plt.legend(fontsize=7, ncol=2)
+    plt.tight_layout()
+    plt.savefig(out_dir / "plot_surrogate_vs_budget.png", dpi=200)
+    plt.close()
+
+    # Plot 4: selected graph density.
+    plt.figure(figsize=(12, 5))
+    plot_df = final.sort_values("selected_graph_density") if not final.empty else results.sort_values("selected_graph_density")
+    if not plot_df.empty:
+        plt.bar(plot_df["dataset"], plot_df["selected_graph_density"])
+        plt.xticks(rotation=60, ha="right")
+        plt.ylabel("Selected graph density")
+        plt.title("Dependency density inside selected crowd")
+        plt.tight_layout()
+        plt.savefig(out_dir / "plot_graph_density.png", dpi=200)
+        plt.close()
+
+    # Optional merged baseline plot.
+    if paper_baselines is not None and not paper_baselines.empty and not final.empty:
+        merged_rows = []
+        for _, row in final.iterrows():
+            merged_rows.append({"dataset": row["dataset"], "method": "GreedyGraph", "accuracy": row["accuracy"]})
+        base = paper_baselines[["dataset", "method", "accuracy"]].copy()
+        comp = pd.concat([base, pd.DataFrame(merged_rows)], ignore_index=True)
         comp.to_csv(out_dir / "merged_with_paper_baselines.csv", index=False)
 
-        pivot = comp.pivot_table(index="dataset", columns="method", values="accuracy", aggfunc="first")
-        if not pivot.empty:
-            datasets = list(pivot.index)
-            methods = list(pivot.columns)
-            x = np.arange(len(datasets))
-            width = 0.85 / max(1, len(methods))
-            plt.figure(figsize=(max(14, 0.75 * len(datasets) + 4), 6))
-            for k, method in enumerate(methods):
-                plt.bar(x + (k - (len(methods) - 1) / 2) * width, pivot[method].values, width=width, label=method)
-            plt.xticks(x, datasets, rotation=60, ha="right")
-            plt.ylabel("Accuracy")
-            plt.title("Current methods vs paper baselines")
-            plt.legend(fontsize=7, ncol=3)
-            plt.tight_layout()
-            plt.savefig(out_dir / "plot_methods_vs_paper_baselines.png", dpi=200)
-            plt.close()
-
-
+        # Plot only methods present; can be crowded but useful.
+        plt.figure(figsize=(14, 6))
+        methods = list(comp["method"].dropna().unique())
+        datasets = list(final["dataset"].unique())
+        x = np.arange(len(datasets))
+        width = 0.8 / max(1, len(methods))
+        for k, method in enumerate(methods):
+            vals = []
+            for d in datasets:
+                sub = comp[(comp["dataset"] == d) & (comp["method"] == method)]
+                vals.append(float(sub["accuracy"].iloc[0]) if len(sub) else np.nan)
+            plt.bar(x + k * width, vals, width=width, label=method)
+        plt.xticks(x + width * (len(methods) - 1) / 2, datasets, rotation=60, ha="right")
+        plt.ylabel("Accuracy")
+        plt.title("GreedyGraph vs paper baselines")
+        plt.legend(fontsize=7, ncol=3)
+        plt.tight_layout()
+        plt.savefig(out_dir / "plot_greedy_vs_paper_baselines.png", dpi=200)
+        plt.close()
 
 
 # =============================================================================
@@ -1254,11 +918,8 @@ def run_one_dataset(
     smoothing_alpha: float,
     surrogate: str,
     lambda_corr: float,
-    lambda_coverage: float,
     fallback_to_all: bool,
     max_bruteforce_nodes: int,
-    methods: Sequence[str],
-    n_random_trials: int,
 ) -> Tuple[List[Dict], Dict]:
     df = load_dataset(data_root, info)
     if df is None:
@@ -1269,8 +930,6 @@ def run_one_dataset(
     train, test = train_test_split_items(df, test_frac=test_frac, seed=seed)
 
     q = estimate_worker_error_rates(train, alpha=smoothing_alpha)
-    q_oracle = estimate_worker_error_rates(df, alpha=smoothing_alpha)
-
     edges, corr_df = estimate_error_correlation_graph(
         train,
         corr_threshold=corr_threshold,
@@ -1279,184 +938,92 @@ def run_one_dataset(
     )
 
     workers = sorted(q.keys())
-    workers_all = sorted(df["worker"].astype(str).unique())
-
     if len(workers) == 0:
         warnings.warn(f"No workers found for {info.canonical_name}. Skipping.")
         return [], {}
 
     tie_order = label_prior_order(train)
-    weights = worker_log_odds_weights(q)
+
+    rows = []
+    selected_by_budget = {}
 
     # Dataset-specific budget. If --budget_percent is provided, each dataset uses
     # ceil(percent * number_of_workers / 100), clipped to [1, n_workers].
-    resolved_budget = resolve_worker_budget(
+    max_budget = resolve_worker_budget(
         n_workers=len(workers),
         budget=budget,
         budget_percent=budget_percent,
         min_budget=1,
     )
-    budget_mode = "percent" if budget_percent is not None else "absolute"
 
-    requested_methods = list(methods) if methods else DEFAULT_METHODS
-    requested = set(requested_methods)
-
-    rows: List[Dict] = []
-    selected_by_method: Dict[str, List[str]] = {}
-
-    def add_row(
-        method: str,
-        selected: Sequence[str],
-        aggregation: str = "mv",
-        is_oracle: bool = False,
-        random_trials: Optional[List[Dict[str, float]]] = None,
-    ) -> None:
-        row = make_method_row(
-            dataset=info.canonical_name,
-            method=method,
-            budget=resolved_budget,
-            budget_mode=budget_mode,
-            budget_percent=budget_percent,
-            selected=selected,
-            train=train,
-            test=test,
-            q=q,
-            edges=edges,
-            workers_all=workers_all,
-            tie_order=tie_order,
-            fallback_to_all=fallback_to_all,
-            max_bruteforce_nodes=max_bruteforce_nodes,
-            aggregation=aggregation,
-            weights=weights,
-            is_oracle=is_oracle,
-            random_trials=random_trials,
-        )
-        row.update({
-            "n_workers_total": len(workers),
-            "n_items_total": df["item"].nunique(),
-            "n_votes_total": len(df),
-            "n_edges_graph": len(edges),
-            "global_graph_density": graph_density(workers, edges),
-            "used_pseudo_truth": used_pseudo_truth,
-            "corr_threshold": corr_threshold,
-            "min_pair_overlap": min_pair_overlap,
-            "lambda_corr": lambda_corr,
-            "lambda_coverage": lambda_coverage,
-        })
-        rows.append(row)
-        selected_by_method[method] = list(map(str, selected))
-
-    # 1. Full-label reference, not budget-matched.
-    if "MV-all" in requested:
-        add_row("MV-all", workers_all, aggregation="mv")
-
-    # 2. Random-B baseline, averaged over multiple random subsets.
-    if "Random-B" in requested:
-        rng = np.random.default_rng(seed)
-        trial_metrics: List[Dict[str, float]] = []
-        for _ in range(max(1, int(n_random_trials))):
-            selected = select_random_workers(workers, resolved_budget, rng)
-            pred = predict_with_selected_workers_aggregation(
-                test,
-                selected,
-                tie_order=tie_order,
-                fallback_to_all=fallback_to_all,
-                aggregation="mv",
-            )
-            trial_metrics.append(evaluate_predictions(pred))
-        add_row("Random-B", [], aggregation="mv", random_trials=trial_metrics)
-
-    # 3. Top individual train accuracy.
-    top_acc = select_top_accuracy_workers(workers, q, resolved_budget)
-    if "TopAccuracy-B" in requested:
-        add_row("TopAccuracy-B", top_acc, aggregation="mv")
-
-    # 4. Greedy max train coverage.
-    if "MaxCoverage-B" in requested:
-        selected = select_max_coverage_workers(train, workers, resolved_budget)
-        add_row("MaxCoverage-B", selected, aggregation="mv")
-
-    # 5. Hybrid accuracy + coverage.
-    if "AccuracyCoverage-B" in requested:
-        selected = select_accuracy_coverage_workers(
-            train,
-            workers,
-            q,
-            resolved_budget,
-            lambda_coverage=lambda_coverage,
-        )
-        add_row("AccuracyCoverage-B", selected, aggregation="mv")
-
-    # 6. Simple low-correlation / accuracy-diversity surrogate.
-    if "LowCorrelation-B" in requested or "AccuracyDiversity-B" in requested:
-        selected, _ = greedy_select(
+    for B in range(1, max_budget + 1):
+        selected, hist = greedy_select(
             workers,
             q=q,
             edges=edges,
-            budget=resolved_budget,
-            fixed_budget=True,
-            surrogate="accuracy_diversity",
-            corr_df=corr_df,
-            lambda_corr=lambda_corr,
-            max_bruteforce_nodes=max_bruteforce_nodes,
-        )
-        add_row("LowCorrelation-B", selected, aggregation="mv")
-
-    # 7. Hard independent-set graph baseline.
-    if "MaxIndependentSet-B" in requested:
-        selected = select_max_independent_accuracy_workers(workers, q, edges, resolved_budget)
-        add_row("MaxIndependentSet-B", selected, aggregation="mv")
-
-    # 8. Your proposed graph-bound greedy.
-    greedy_graph_selected: Optional[List[str]] = None
-    if "GreedyGraph-B" in requested or "GreedyGraph-WeightedMV" in requested:
-        greedy_graph_selected, hist = greedy_select(
-            workers,
-            q=q,
-            edges=edges,
-            budget=resolved_budget,
+            budget=B,
             fixed_budget=True,
             surrogate=surrogate,
             corr_df=corr_df,
             lambda_corr=lambda_corr,
             max_bruteforce_nodes=max_bruteforce_nodes,
         )
-        if "GreedyGraph-B" in requested:
-            add_row("GreedyGraph-B", greedy_graph_selected, aggregation="mv")
 
-    # 9. Weighted vote variants.
-    if "GreedyGraph-WeightedMV" in requested:
-        if greedy_graph_selected is None:
-            greedy_graph_selected, _ = greedy_select(
-                workers,
-                q=q,
-                edges=edges,
-                budget=resolved_budget,
-                fixed_budget=True,
-                surrogate=surrogate,
-                corr_df=corr_df,
-                lambda_corr=lambda_corr,
-                max_bruteforce_nodes=max_bruteforce_nodes,
-            )
-        add_row("GreedyGraph-WeightedMV", greedy_graph_selected, aggregation="weighted_mv")
+        pred = predict_with_selected_workers(
+            test,
+            selected,
+            tie_order=tie_order,
+            fallback_to_all=fallback_to_all,
+        )
+        metrics = evaluate_predictions(pred)
 
-    if "TopAccuracy-WeightedMV" in requested:
-        add_row("TopAccuracy-WeightedMV", top_acc, aggregation="weighted_mv")
+        val = graph_surrogate(selected, q, edges, max_bruteforce_nodes=max_bruteforce_nodes) if surrogate == "graph_bound" else simple_accuracy_diversity_surrogate(selected, q, corr_df, lambda_corr=lambda_corr)
+        alpha = len(max_independent_set_exact(selected, edges, max_bruteforce_nodes=max_bruteforce_nodes))
+        density = graph_density(selected, edges)
 
-    # 10. Oracle upper bound: selects by full-data worker accuracy.
-    if "OracleTopAccuracy-B" in requested:
-        selected = select_top_accuracy_workers(workers, q_oracle, resolved_budget)
-        add_row("OracleTopAccuracy-B", selected, aggregation="mv", is_oracle=True)
+        row = {
+            "dataset": info.canonical_name,
+            "budget": B,
+            "budget_mode": "percent" if budget_percent is not None else "absolute",
+            "budget_percent": budget_percent,
+            "selected_size": len(selected),
+            "selected_workers": "|".join(selected),
+            "surrogate": surrogate,
+            "surrogate_value": val,
+            "accuracy": metrics["accuracy"],
+            "coverage": metrics["coverage"],
+            "n_eval_items": metrics["n_eval_items"],
+            "fallback_rate": metrics["fallback_rate"],
+            "selected_graph_density": density,
+            "selected_alpha": alpha,
+            "n_workers_total": len(workers),
+            "n_items_total": df["item"].nunique(),
+            "n_votes_total": len(df),
+            "n_edges_graph": len(edges),
+            "global_graph_density": graph_density(workers, edges),
+            "used_pseudo_truth": used_pseudo_truth,
+            "is_final": False,
+        }
+        rows.append(row)
+        selected_by_budget[B] = selected
+
+    if fixed_budget:
+        final_budget = max_budget
+    else:
+        # Choose budget with lowest surrogate along the sweep.
+        valid = [r for r in rows if not np.isnan(r["surrogate_value"])]
+        final_budget = min(valid, key=lambda r: r["surrogate_value"])["budget"] if valid else max_budget
+
+    for r in rows:
+        r["is_final"] = (r["budget"] == final_budget)
 
     selected_info = {
         "dataset": info.canonical_name,
-        "budget": resolved_budget,
-        "budget_mode": budget_mode,
+        "final_budget": final_budget,
+        "budget_mode": "percent" if budget_percent is not None else "absolute",
         "budget_percent": budget_percent,
-        "methods": requested_methods,
-        "selected_by_method": selected_by_method,
+        "selected_by_budget": selected_by_budget,
         "q_error_rates": q,
-        "q_oracle_error_rates": q_oracle,
         "edges": list([list(e) for e in sorted(edges)]),
         "used_pseudo_truth": used_pseudo_truth,
     }
@@ -1465,13 +1032,11 @@ def run_one_dataset(
     ds_out = out_dir / "per_dataset" / info.canonical_name
     ds_out.mkdir(parents=True, exist_ok=True)
     corr_df.to_csv(ds_out / "pairwise_error_correlations.csv", index=False)
-    pd.DataFrame(rows).to_csv(ds_out / "method_results.csv", index=False)
+    pd.DataFrame(rows).to_csv(ds_out / "budget_sweep.csv", index=False)
     with open(ds_out / "selected_workers.json", "w", encoding="utf-8") as f:
         json.dump(selected_info, f, indent=2, ensure_ascii=False)
 
     return rows, selected_info
-
-
 
 
 def main() -> None:
@@ -1488,10 +1053,7 @@ def main() -> None:
     parser.add_argument("--min_pair_overlap", type=int, default=5, help="Minimum co-labeled items for pairwise correlation.")
     parser.add_argument("--smoothing_alpha", type=float, default=1.0, help="Beta smoothing for worker error rates.")
     parser.add_argument("--surrogate", choices=["graph_bound", "accuracy_diversity"], default="graph_bound")
-    parser.add_argument("--lambda_corr", type=float, default=1.0, help="Penalty weight for LowCorrelation-B / accuracy_diversity surrogate.")
-    parser.add_argument("--lambda_coverage", type=float, default=1.0, help="Coverage weight for AccuracyCoverage-B baseline.")
-    parser.add_argument("--methods", nargs="*", default=None, help="Methods to run. Default: all benchmark methods.")
-    parser.add_argument("--n_random_trials", type=int, default=50, help="Number of random subsets for Random-B baseline.")
+    parser.add_argument("--lambda_corr", type=float, default=1.0, help="Penalty weight for accuracy_diversity surrogate.")
     parser.add_argument("--fallback_to_all", action="store_true", help="If selected workers do not cover a test item, use all available votes.")
     parser.add_argument("--paper_baselines_csv", type=str, default=None, help="Optional CSV with columns dataset,method,accuracy.")
     parser.add_argument("--max_bruteforce_nodes", type=int, default=22, help="Exact maximum independent set up to this subset size.")
@@ -1532,11 +1094,8 @@ def main() -> None:
             smoothing_alpha=args.smoothing_alpha,
             surrogate=args.surrogate,
             lambda_corr=args.lambda_corr,
-            lambda_coverage=args.lambda_coverage,
             fallback_to_all=args.fallback_to_all,
             max_bruteforce_nodes=args.max_bruteforce_nodes,
-            methods=args.methods if args.methods is not None else DEFAULT_METHODS,
-            n_random_trials=args.n_random_trials,
         )
         all_rows.extend(rows)
         if selected_info:
@@ -1560,14 +1119,7 @@ def main() -> None:
         print("No datasets were loaded. Check --data_root and dataset folder names.")
     else:
         final = results[results["is_final"]].copy()
-        cols = [
-            "dataset", "method", "budget", "budget_mode", "budget_percent",
-            "selected_size", "aggregation", "accuracy", "accuracy_std",
-            "coverage", "coverage_std", "surrogate_value", "selected_graph_density",
-            "selected_alpha", "is_oracle",
-        ]
-        cols = [c for c in cols if c in final.columns]
-        print(final[cols].to_string(index=False))
+        print(final[["dataset", "budget", "budget_mode", "budget_percent", "selected_size", "accuracy", "coverage", "surrogate_value"]].to_string(index=False))
 
 
 if __name__ == "__main__":
