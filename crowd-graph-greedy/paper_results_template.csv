@@ -1,0 +1,4 @@
+dataset,method,accuracy
+CF,PaperMethod,0.0
+SP,PaperMethod,0.0
+adult,PaperMethod,0.0
